@@ -3,6 +3,8 @@ from collections import Counter, defaultdict
 import os
 from random import shuffle
 import tensorflow as tf
+import time
+from pathlib import Path
 
 
 class NotTrainedError(Exception):
@@ -72,6 +74,7 @@ class GloVeModel():
                                                   name="context_words")
             self.__cooccurrence_count = tf.placeholder(tf.float32, shape=[self.batch_size],
                                                        name="cooccurrence_count")
+            self.global_step = tf.Variable(0, trainable=False)
 
             focal_embeddings = tf.Variable(
                 tf.random_uniform([self.vocab_size, self.embedding_size], 1.0, -1.0),
@@ -116,19 +119,28 @@ class GloVeModel():
             self.__combined_embeddings = tf.add(focal_embeddings, context_embeddings,
                                                 name="combined_embeddings")
 
-    def train(self, num_epochs, log_dir=None, summary_batch_interval=1000,
+    def train(self, num_epochs, checkpoint_dir, log_dir=None, summary_batch_interval=1000,
               tsne_epoch_interval=None):
         should_write_summaries = log_dir is not None and summary_batch_interval
         should_generate_tsne = log_dir is not None and tsne_epoch_interval
         batches = self.__prepare_batches()
-        total_steps = 0
+        start = time.perf_counter()
+        checkpoint_file = Path(checkpoint_dir + "/checkpoint")
         with tf.Session(graph=self.__graph) as session:
             if should_write_summaries:
                 print("Writing TensorBoard summaries to {}".format(log_dir))
                 summary_writer = tf.summary.FileWriter(log_dir, graph=session.graph)
             tf.global_variables_initializer().run()
+            saver = tf.train.Saver(tf.global_variables(),max_to_keep=3)
+            if checkpoint_file.is_file():
+                checkpoint_path = open(checkpoint_dir + '/checkpoint', 'r')
+                checkpoint_path = "".join(["",checkpoint_path.read().splitlines()[0].split('"')[1] ])
+                print("Restoring previous checkpoint: "+checkpoint_path)
+                saver.restore(session, checkpoint_path)
+            total_steps = session.run(self.global_step)
             for epoch in range(num_epochs):
                 shuffle(batches)
+                loss = None
                 for batch_index, batch in enumerate(batches):
                     i_s, j_s, counts = batch
                     if len(counts) != self.batch_size:
@@ -137,7 +149,7 @@ class GloVeModel():
                         self.__focal_input: i_s,
                         self.__context_input: j_s,
                         self.__cooccurrence_count: counts}
-                    session.run([self.__optimizer], feed_dict=feed_dict)
+                    _, loss = session.run([self.__optimizer, self.__total_loss], feed_dict=feed_dict)
                     if should_write_summaries and (total_steps + 1) % summary_batch_interval == 0:
                         summary_str = session.run(self.__summary, feed_dict=feed_dict)
                         summary_writer.add_summary(summary_str, total_steps)
@@ -146,6 +158,12 @@ class GloVeModel():
                     current_embeddings = self.__combined_embeddings.eval()
                     output_path = os.path.join(log_dir, "epoch{:03d}.png".format(epoch + 1))
                     self.generate_tsne(output_path, embeddings=current_embeddings)
+                saver.save(session, checkpoint_dir + "/model.ckpt", global_step=total_steps)
+                hours, rem = divmod(time.perf_counter() - start, 3600)
+                minutes, seconds = divmod(rem, 60)
+                print(" Epoch {0}: Model is saved".format(epoch),
+                "Elapsed: {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds),
+                "Steps: {0} Loss: {1}".format(total_steps,loss), "\n")
             self.__embeddings = self.__combined_embeddings.eval()
             if should_write_summaries:
                 summary_writer.close()
